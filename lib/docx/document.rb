@@ -21,8 +21,17 @@ module Docx
   #   end
   class Document
     include Docx::SimpleInspect
+    
+    # A path with * indicates that there are possibly multiple documents
+    # matching that glob, eg. word/header1.xml, word/header2.xml
+    DOCUMENT_PATHS = {
+      doc: "word/document.xml",
+      headers: "word/header*.xml",
+      footers: "word/footer*.xml",
+      numbering: "word/numbering.xml"
+    }
 
-    attr_reader :xml, :doc, :zip, :styles, :headers, :footers
+    attr_reader :xml, :doc, :zip, :styles, :headers, :footers, :numbering
 
     def initialize(path_or_io, options = {})
       @replace = {}
@@ -35,13 +44,10 @@ module Docx
         @zip = Zip::File.open_buffer(path_or_io)
       end
 
-      document = @zip.glob('word/document*.xml').first
       raise Errno::ENOENT if document.nil?
 
       @document_xml = document.get_input_stream.read
-      @doc = Nokogiri::XML(@document_xml)
-      @headers = fetch_headers
-      @footers = fetch_footers
+      extract_documents
       load_styles
       yield(self) if block_given?
     ensure
@@ -75,20 +81,6 @@ module Docx
       bkmrks_ary.reject! { |b| b.name == '_GoBack' }
       bkmrks_ary.each { |b| bkmrks_hsh[b.name] = b }
       bkmrks_hsh
-    end
-
-    def fetch_headers
-      @zip.glob('word/header*.xml').map do |entry|
-        header_xml = entry.get_input_stream.read
-        Nokogiri::XML(header_xml)
-      end
-    end
-
-    def fetch_footers
-      @zip.glob('word/footer*.xml').map do |entry|
-        footer_xml = entry.get_input_stream.read
-        Nokogiri::XML(footer_xml)
-      end
     end
 
     def to_xml
@@ -201,6 +193,33 @@ module Docx
 
     private
 
+    def extract_documents
+      DOCUMENT_PATHS.each do |attr_name, path|
+        if path.match /\*/
+          extract_multiple_documents_from_globbed_path(attr_name, path)
+        else
+          extract_single_document_from_path(attr_name, path)
+        end
+      end
+    end
+
+    def extract_single_document_from_path(attr_name, path)
+      if @zip.find_entry(path)
+        xml_doc = @zip.read(path)
+        self.instance_variable_set(:"@#{attr_name}", Nokogiri::XML(xml_doc))
+      end
+    end
+
+    def extract_multiple_documents_from_globbed_path(hash_attr_name, glob_path)
+      files = @zip.glob(glob_path).map { |h| h.name }
+      filename_and_contents_pairs = files.map do |file|
+        simple_file_name = file.sub(/^word\//, "").sub(/\.xml$/, "")
+        [simple_file_name, Nokogiri::XML(@zip.read(file))]
+      end 
+      hash = Hash[filename_and_contents_pairs]
+      self.instance_variable_set(:"@#{hash_attr_name}", hash)
+    end
+
     def load_styles
       @styles_xml = @zip.read('word/styles.xml')
       @styles = Nokogiri::XML(@styles_xml)
@@ -224,14 +243,18 @@ module Docx
     # end of methods that make edits?
     #++
     def update
-      replace_entry 'word/document.xml', doc.serialize(save_with: 0)
+      # replace_entry 'word/document.xml', doc.serialize(save_with: 0)
+      DOCUMENT_PATHS.each do |attr_name, path|
+        if path.match /\*/
+          self.instance_variable_get("@#{attr_name}").each do |simple_file_name, contents|
+            replace_entry("word/#{simple_file_name}.xml", contents.serialize(:save_with => 0))
+          end
+        else
+          xml_document = self.instance_variable_get("@#{attr_name}")
+          replace_entry path, xml_document.serialize(:save_with => 0) if xml_document
+        end
+      end 
       replace_entry 'word/styles.xml', styles_configuration.serialize(save_with: 0)
-      headers.each_with_index do |header, index|
-        replace_entry "word/header#{index + 1}.xml", header.serialize(:save_with => 0) if header
-      end
-      footers.each_with_index do |footer, index|
-        replace_entry "word/footer#{index + 1}.xml", footer.serialize(:save_with => 0) if footer
-      end
     end
 
     # generate Elements::Containers::Paragraph from paragraph XML node
